@@ -172,6 +172,17 @@ class CityLayer:
                 centres.append((near.mean(axis=0)))
                 tone.append(rng.normal(0, 0.035))
                 bridge.append(bool(br[i] and br[i + 1]))
+                if ln.kind in ("primary", "secondary", "local"):
+                    # pavement strip on each side (lighter concrete, kerb-height): roads stop looking like ribbons
+                    for sgn in (-1, 1):
+                        a0 = P[i] + nrm[i] * sgn * (hw + 0.05)
+                        a1 = P[i + 1] + nrm[i + 1] * sgn * (hw + 0.05)
+                        b0 = P[i] + nrm[i] * sgn * (hw + (1.5 if ln.kind != "local" else 1.0))
+                        b1 = P[i + 1] + nrm[i + 1] * sgn * (hw + (1.5 if ln.kind != "local" else 1.0))
+                        pz = lambda X, ok: (zz[ok] if br[ok] else float(T.height(*X))) + _ROAD_LIFT + 0.03   # noqa: E731
+                        mk_quads.append(np.array([[*a0, pz(a0, i)], [*a1, pz(a1, i + 1)], [*b1, pz(b1, i + 1)], [*b0, pz(b0, i)]]))
+                        mk_cols.append((168, 164, 156))
+                        mk_par.append(len(quads) - 1)
                 if ln.kind in ("primary", "secondary", "runway") and i % 2 == 0:
                     # centre-line dash
                     a = P[i] + (P[i + 1] - P[i]) * 0.15
@@ -363,6 +374,7 @@ class CityLayer:
     _WALL_IDX = ((0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7))
 
     def _draw_building(self, surf, v: View, d):
+        self._plant_f = v.f
         m, i, cam, scr, dist, wv, sv, tv, fw, frs, frf, fg, glow = d
         b = self.world.buildings
         poly = pygame.draw.polygon
@@ -392,10 +404,14 @@ class CityLayer:
             pts = quad(ids, fw[k])
             if pts is not None and not near_clip and dist < 135:
                 self._windows(surf, i, k, pts, dist, fw[k], glow)
+            if pts is not None and not near_clip and dist < 150:
+                self._wall_detail(surf, pts, fw[k], int(b.roof[i]) == ROOF_FLAT, dist)
         roof = int(b.roof[i])
         if roof == ROOF_FLAT:
             if tv:
                 quad((4, 5, 6, 7), frf)
+                if not near_clip and dist < 110 and kind != KIND_TOWER:
+                    self._roof_plant(surf, sx[4:8], frf, i, dist)
         else:
             if wv[1] and not near_clip:                        # gable end triangles (x+ / x-)
                 poly(surf, _rgb(fg[0]), [tuple(sx[k]) for k in (5, 6, 9)])
@@ -405,6 +421,44 @@ class CityLayer:
                 quad((4, 5, 9, 8), frs[0])
             if sv[1]:
                 quad((7, 6, 9, 8), frs[1])
+
+    @staticmethod
+    def _wall_detail(surf, P, wall_col, flat_roof: bool, dist: float) -> None:
+        """Two cheap cues that make a box read as a building: a darker band where the wall meets the ground (dirt,
+        splash, less sky light) and a lighter parapet lip along a flat roof's edge.  P = [bottom-a, bottom-b, top-b, top-a]."""
+        p0, p1, p2, p3 = (np.array(q, float) for q in P)
+        hpx = float(np.hypot(*(p3 - p0)))
+        if hpx < 14:
+            return
+        poly = pygame.draw.polygon
+        t = 0.07
+        a, b = p0 + (p3 - p0) * t, p1 + (p2 - p1) * t
+        poly(surf, _rgb([c * 0.66 for c in wall_col]), [tuple(map(int, q)) for q in (p0, p1, b, a)])
+        if flat_roof:
+            t2 = 0.965
+            a2, b2 = p0 + (p3 - p0) * t2, p1 + (p2 - p1) * t2
+            poly(surf, _rgb([c * 1.14 + 6 for c in wall_col]), [tuple(map(int, q)) for q in (a2, b2, p2, p3)])
+
+    def _roof_plant(self, surf, R, roof_col, i, dist) -> None:
+        """A small stair/lift housing and a water tank on flat roofs: stops rooftops reading as bare grey slabs.
+        R = screen corners of the roof (4..7). Placement comes from the building index, so it is stable."""
+        poly = pygame.draw.polygon
+        P = np.array(R, float)
+        f = self._plant_f
+        for n, (u0, v0, du, dv, h_m, k) in enumerate(((0.18, 0.2, 0.2, 0.26, 2.6, 0.82), (0.62, 0.55, 0.14, 0.18, 1.7, 1.12))):
+            if (i + n) % 3 == 0:
+                continue
+            uu, vv = (u0 + 0.35 * ((i * 7 + n * 3) % 4) / 4) % 0.7, (v0 + 0.3 * ((i * 5 + n) % 4) / 4) % 0.6
+
+            def at(u, v_):
+                return P[0] * (1 - u) * (1 - v_) + P[1] * u * (1 - v_) + P[2] * u * v_ + P[3] * (1 - u) * v_
+            base = [at(uu, vv), at(uu + du, vv), at(uu + du, vv + dv), at(uu, vv + dv)]
+            hp = max(1.5, f * h_m / max(dist, 6.0))
+            top = [(x, y - hp) for x, y in base]
+            body = [c * k for c in roof_col]
+            for a_, b_ in zip(range(4), (1, 2, 3, 0)):
+                poly(surf, _rgb([c * 0.7 for c in body]), [tuple(map(int, q)) for q in (base[a_], base[b_], top[b_], top[a_])])
+            poly(surf, _rgb(body), [tuple(map(int, q)) for q in top])
 
     def _windows(self, surf, i, k, P, dist, wall_col, glow):
         """Window rows on one wall face. P = screen quad [bottom-a, bottom-b, top-b, top-a]."""

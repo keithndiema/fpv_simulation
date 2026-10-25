@@ -121,7 +121,14 @@ class _Shaded:
         slope = np.hypot(gx, gy)
         wet = hq < T.water_level + 0.05
         rng = np.random.default_rng(stride)
-        tone = rng.random(hq.shape)
+        # Ground colour variation at three scales (broad patches, medium mottling, fine grain). Pure white noise
+        # per quad reads as a checkerboard; real fields vary smoothly with a little grain on top.
+        def z(a):
+            return (a - a.mean()) / (a.std() + 1e-9)
+        white = rng.random(hq.shape)
+        broad = box_blur(rng.random(hq.shape), max(2, int(30 / self.cell)))
+        mid = box_blur(rng.random(hq.shape), max(1, int(9 / self.cell)))
+        tone = np.clip(0.5 + 0.17 * (0.75 * z(broad) + 0.5 * z(mid) + 0.45 * z(white)), 0.0, 1.0)
         if T.landcover is not None:
             col = self._cover_colours(T, stride, hq, slope, tone, style)
         else:
@@ -130,7 +137,7 @@ class _Shaded:
         lm = light[::stride, ::stride]
         sh = (lm[:-1, :-1] + lm[1:, 1:]) * 0.5
         lit = atm.amb_col[None, None, :] + atm.sun_col[None, None, :] * (lam * sh)[..., None]
-        col = col * lit
+        col = col * lit * self._contact_shading(T, stride, hq)[..., None]
         depth = np.clip(-(h00 + h10 + h01 + h11) / 4 / 3.0, 0, 1)
         deep = _mix(np.array(WATER_SHALLOW, float), np.array(WATER_DEEP, float), depth[..., None])
         water = deep * (0.85 + 0.20 * tone[..., None]) * (atm.amb_col + atm.sun_col * 0.35)[None, None, :]
@@ -138,6 +145,29 @@ class _Shaded:
         self.rgb = np.clip(col, 0, 255)
         self.wet = wet
         self.tone = tone
+
+    def _contact_shading(self, T: Terrain, stride: int, hq: np.ndarray) -> np.ndarray:
+        """Ambient occlusion on the ground: soil next to a wall gets less sky light, so it is darker.
+
+        Blur the building raster (1 = covered by a roof) and darken ground cells in proportion to how much of their
+        neighbourhood is a building - but not the cells under the building itself (they are hidden anyway).
+        """
+        w = getattr(T, "world", None)
+        out = np.ones(hq.shape)
+        if w is None or getattr(w, "occ_h", None) is None:
+            return out
+        occ = (w.occ_h > 0.5).astype(np.float64)
+        cell = w.occ_cell
+        ao = box_blur(occ, max(1, int(round(4.5 / cell))))                  # ~4.5 m radius
+        n = hq.shape[0]
+        j, i = np.mgrid[0:n, 0:hq.shape[1]]
+        x = T.ox + (i + 0.5) * self.cell
+        y = T.oy + (j + 0.5) * self.cell
+        ii = np.clip(((x - T.ox) / cell).astype(int), 0, ao.shape[1] - 1)
+        jj = np.clip(((y - T.oy) / cell).astype(int), 0, ao.shape[0] - 1)
+        under = occ[jj, ii] > 0.5
+        out = 1.0 - 0.34 * np.clip(ao[jj, ii] * 1.7, 0, 1) * (~under)
+        return out
 
     @staticmethod
     def _legacy_colours(hq, slope, tone):
@@ -352,12 +382,19 @@ class WorldRenderer:
             pts = [b0 + th * L, b0 - th * L, b1 - th * L, b1 + th * L]
             pygame.draw.polygon(surf, color, [tuple(map(int, p)) for p in pts])
 
-        bands = 28
-        span = v.f * 1.25                          # the gradient spans roughly 50 degrees above the horizon
-        offs = [span * (i / bands) ** 1.5 for i in range(bands)] + [L]
+        # Why this curve?  Real clear skies are brightest and palest at the horizon (light has crossed the most air
+        # there) and deepen towards the zenith.  Colour is therefore a function of the *elevation angle* above the
+        # horizon, not of screen position: an exponential falloff from the haze colour to the mid-sky colour, then a
+        # smooth blend to the zenith.  44 bands whose steps are equal in angle keep the gradient free of visible banding.
+        bands = 44
+        top = 1.35                                   # radians above the horizon covered by the gradient
+        ang = [top * (i / bands) ** 1.7 for i in range(bands + 1)]
+        offs = [v.f * math.tan(x) for x in ang[:-1]] + [L]
         for i in range(bands):
-            k = 1.0 - (i + 0.5) / bands            # 1 at the horizon, 0 at the top of the gradient
-            col = theme.lerp(a.zenith, a.mid, min(1.0, k * 1.35)) if k < 0.72 else theme.lerp(a.mid, a.haze, (k - 0.72) / 0.28)
+            th_mid = 0.5 * (ang[i] + ang[i + 1])
+            s1 = 1.0 - math.exp(-th_mid / 0.17)                       # haze -> mid sky
+            s2 = min(1.0, max(0.0, (th_mid - 0.12) / 1.1)) ** 1.4     # mid sky -> zenith
+            col = theme.lerp(theme.lerp(a.haze, a.mid, s1), a.zenith, s2)
             strip(offs[i], offs[i + 1], col)
         b0 = c + nh * d0
         pts = [b0 + th * L, b0 - th * L, b0 - th * L + nh * L, b0 + th * L + nh * L]
@@ -477,7 +514,9 @@ class WorldRenderer:
         wetq = grid.wet[j0:j1, i0:i1][vis]
         if wetq.any():
             base = self._water_shine(base, wetq, centre[vis], grid.tone[j0:j1, i0:i1][vis], v)
-        cols = self._fog_color(base, keys)
+        # water keeps its colour at a distance (real lakes read as dark blue-grey against the pale horizon haze), so it
+        # is fogged as if it were 40% nearer
+        cols = self._fog_color(base, np.where(wetq, keys * 0.6, keys))
         polys = s4[vis].astype(int).tolist()
         strad = (nb > 0) & (nb < 4)
         if max_dist is not None:
@@ -558,16 +597,24 @@ class WorldRenderer:
         cut = 4.0 if True else 0
         for k in range(len(idx)):
             out.append((float(dist[k]) - (4.0 if dist[k] < self.tree_near else 10.0), 0,
-                        (bx[k], by[k], hp[k], wp[k], tuple(int(c) for c in fogc[k]), int(kind[k]), float(dist[k]))))
+                        (bx[k], by[k], hp[k], wp[k], tuple(int(c) for c in fogc[k]), int(kind[k]), float(dist[k]), float(tone[k]))))
         return out
 
     def _draw_tree(self, surf, d):
-        bx, by, hp, wp, col, kind, dist = d
+        bx, by, hp, wp, col, kind, dist, seed = d
         poly, line, ell = pygame.draw.polygon, pygame.draw.line, pygame.draw.ellipse
         dark = (int(col[0] * 0.70), int(col[1] * 0.72), int(col[2] * 0.74))
         light = (min(255, int(col[0] * 1.18)), min(255, int(col[1] * 1.18)), min(255, int(col[2] * 1.12)))
         hz = self.atm.haze
         trunk = theme.lerp((92, 66, 44), hz, min(1.0, max(0.0, (dist - 60) / 320)))
+        # ground shadow: a flat dark ellipse thrown away from the sun (direction and length set per frame in draw())
+        if wp >= 2.2 and self.atm.sun_el > 3.0:
+            ux, uy, ln = self._shadow_vec
+            fogf = min(1.0, max(0.0, (dist - self.atm.fog_start) / (self.atm.fog_end - self.atm.fog_start)))
+            sc = theme.lerp(self._shadow_tint, hz, fogf)
+            sw, sh = wp * (1.4 + 0.5 * ln), max(2.0, wp * 0.34)
+            cxs, cys = bx + ux * wp * ln, by + uy * wp * ln * 0.5
+            ell(surf, sc, (cxs - sw * 0.5 - wp * 0.1, cys - sh * 0.5, sw, sh))
         if wp < 2.2:                                              # far: one blob
             if kind == CONIFER:
                 poly(surf, col, [(bx - wp, by), (bx + wp, by), (bx, by - hp)])
@@ -607,9 +654,26 @@ class WorldRenderer:
                 line(surf, light if k % 2 else col, top, (ex, ey), max(2, int(wp * 0.5)))
         else:                                                      # round broadleaf / flowering crown
             line(surf, trunk, (bx, by), (bx, by - hp * 0.5), max(1, int(wp * 0.2)))
-            ell(surf, dark, (bx - wp, by - hp * 1.0, wp * 2, hp * 0.62))
-            ell(surf, col, (bx - wp * 0.9, by - hp * 1.0, wp * 1.7, hp * 0.52))
-            ell(surf, light, (bx - wp * 0.65, by - hp * 1.0, wp * 1.1, hp * 0.3))
+            if wp < 8.0:                                           # mid distance: the cheap three-ellipse crown
+                ell(surf, dark, (bx - wp, by - hp * 1.0, wp * 2, hp * 0.62))
+                ell(surf, col, (bx - wp * 0.9, by - hp * 1.0, wp * 1.7, hp * 0.52))
+                ell(surf, light, (bx - wp * 0.65, by - hp * 1.0, wp * 1.1, hp * 0.3))
+            else:
+                # Near trees get a lumpy crown: a dark under-canopy, four overlapping leaf clusters whose positions
+                # come from the tree's own seed (so each tree is different but never flickers), and a highlight
+                # on the side facing the sun.
+                sd = int(seed * 1000) % 97
+                ell(surf, dark, (bx - wp * 1.0, by - hp * 0.98, wp * 2.0, hp * 0.62))
+                for k in range(4):
+                    ox = ((sd * (k + 3)) % 13 / 13.0 - 0.5) * wp * 1.05
+                    oy = ((sd * (k + 5)) % 11 / 11.0 - 0.5) * hp * 0.16
+                    r = wp * (0.62 + 0.14 * ((sd + k) % 3))
+                    shade = 0.90 + 0.05 * ((sd + 2 * k) % 5)
+                    c2 = (min(255, int(col[0] * shade)), min(255, int(col[1] * shade)), min(255, int(col[2] * shade)))
+                    ell(surf, c2, (bx + ox - r, by - hp * 0.82 + oy - r * 0.62, r * 2.0, r * 1.25))
+                sx = self._sun_side * wp * 0.38
+                ell(surf, light, (bx + sx - wp * 0.5, by - hp * 0.98, wp * 1.0, hp * 0.26))
+                ell(surf, dark, (bx - wp * 0.7, by - hp * 0.52, wp * 1.4, hp * 0.12))      # shade under the crown
 
     # ------------------------------------------------------------------ legacy boxes, gates, targets
     def _collect_boxes(self, v: View):
@@ -827,6 +891,7 @@ class WorldRenderer:
         city = self.city
         if city is not None:
             city.update(dt)
+        self._frame_vectors(v)
         self._sky(surf, v)
         self._sun(surf, v)
         self._clouds_draw(surf, v)
@@ -858,6 +923,74 @@ class WorldRenderer:
             self._shadow(surf, v, st)
             self._drone_model(surf, v, st)
         self._draw_particles(surf, v, effects)
+        if self.quality >= 1:
+            self._post(surf, v)
+
+    # ------------------------------------------------------------------ camera look
+    def _frame_vectors(self, v: View) -> None:
+        """Per-frame sun geometry used by trees: which way shadows fall on screen and which side is lit."""
+        a = self.atm
+        sun = a.sun_dir
+        cam = sun @ v.R
+        self._sun_side = -1.0 if cam[1] > 0 else 1.0               # sun on the left of the picture -> lit side is left
+        if cam[0] < -0.2:
+            self._sun_side = 0.0                                    # sun behind the camera: trees are lit face-on
+        h = np.array([-sun[0], -sun[1], 0.0])
+        hn = np.linalg.norm(h)
+        h = h / hn if hn > 1e-6 else h
+        c = h @ v.R                                                 # shadow direction in camera axes (forward, left, up)
+        ln = min(2.4, max(0.45, 1.0 / math.tan(max(math.radians(a.sun_el), 0.12))))
+        self._shadow_vec = (-float(c[1]), -float(c[0]) , ln)       # screen x grows to the right, y downwards
+        self._shadow_tint = tuple(int(x) for x in (np.array((92, 88, 66), float) * (a.amb_col + a.sun_col * 0.05)).clip(0, 255))
+
+    def _post(self, surf: pygame.Surface, v: View) -> None:
+        """Camera-sensor look: film grain and a lens flare when the sun is in view.
+
+        None of this changes the geometry - it hides the 'flat polygon' look the way a real lens and sensor do.
+        (A bloom pass was tried and removed: it cost ~3 ms and washed out hazy lakes.)
+        """
+        w, h = surf.get_size()
+        # film grain: one ADD blit of a pre-made noise frame (three variants cycled so it shimmers)
+        if getattr(self, "_grain_size", None) != (w, h):
+            rng = np.random.default_rng(3)
+            self._grain = []
+            for _ in range(3):
+                n = (rng.random((w, h)) * 9).astype(np.uint8)
+                self._grain.append(pygame.surfarray.make_surface(np.stack([n, n, n], axis=-1)))
+            self._grain_size = (w, h)
+        self._grain_i = (getattr(self, "_grain_i", 0) + 1) % 3
+        surf.blit(self._grain[self._grain_i], (0, 0), special_flags=pygame.BLEND_RGB_ADD)
+
+        self._lens_flare(surf, v)
+
+    def _lens_flare(self, surf: pygame.Surface, v: View) -> None:
+        cam = self.atm.sun_dir @ v.R
+        if cam[0] < 0.1 or self.atm.sun_visible < 0.5:
+            return
+        sx, sy = v.cx - v.f * cam[1] / cam[0], v.cy - v.f * cam[2] / cam[0]
+        w, h = surf.get_size()
+        if not (0 <= sx < w and 0 <= sy < h):
+            return
+        px = surf.get_at((int(sx), int(sy)))
+        if px[0] + px[1] + px[2] < 560:                             # something (a building, a cloud) covers the sun
+            return
+        if getattr(self, "_flare", None) is None:
+            self._flare = []
+            for rad, k in ((16, 0.9), (30, 0.55), (56, 0.3)):
+                n = rad * 2
+                yy, xx = np.mgrid[0:n, 0:n]
+                r = np.hypot(xx - rad + 0.5, yy - rad + 0.5) / rad
+                ring = np.clip(1 - np.abs(r - 0.78) / 0.22, 0, 1) * 0.5 + np.clip(1 - r, 0, 1) * 0.5
+                g = np.clip(ring * 60 * k, 0, 255).astype(np.uint8)
+                self._flare.append(pygame.surfarray.make_surface(np.stack([g, (g * 0.9).astype(np.uint8), (g * 0.7).astype(np.uint8)], axis=-1)))
+        d = math.hypot(sx - w / 2, sy - h / 2) / math.hypot(w / 2, h / 2)
+        k = max(0.0, 1.0 - d * 0.9)                                 # strongest when the sun is near the middle
+        if k <= 0.02:
+            return
+        for spr, t in zip(self._flare, (-0.55, -1.1, 0.5)):
+            fx, fy = w / 2 + (sx - w / 2) * t, h / 2 + (sy - h / 2) * t
+            s2 = spr if k > 0.85 else pygame.transform.smoothscale(spr, (max(2, int(spr.get_width() * (0.5 + 0.5 * k))),) * 2)
+            surf.blit(s2, s2.get_rect(center=(int(fx), int(fy))), special_flags=pygame.BLEND_RGB_ADD)
 
     def _paint(self, surf, v: View, keys, polys, cols, objs) -> None:
         order = np.argsort(-keys) if len(keys) else []
